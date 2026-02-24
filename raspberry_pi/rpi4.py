@@ -45,18 +45,17 @@ throttle = PWMThrottle(
 )
 
 
-def start_tcp_server():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(('0.0.0.0',TCP_PORT))
-    sock.listen(1)
+def start_udp_server():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('0.0.0.0', UDP_PORT))
 
-    print(f"TCP Server listening on port {TCP_PORT}...")
-    conn, addr = sock.accept()
-    print(f"Connected by {addr}")
+    print(f"UDP Server listening on port {UDP_PORT}...")
 
     while True:
         try:
-            data = conn.recv(1024).decode("utf-8").strip()
+            data, addr = sock.recvfrom(1024)
+            data = data.decode("utf-8").strip()
+
             if not data:
                 continue
 
@@ -69,20 +68,20 @@ def start_tcp_server():
             steering.run(steering_value)
             throttle.run(throttle_value)
 
-        except(sock.error, KeyboardInterrupt):
-            print("Connection lost or interrupted. Shutting down...")
+        except (socket.error, KeyboardInterrupt):
+            print("Socket error or interrupted. Shutting down...")
             break
 
-    conn.close()
     sock.close()
 
 #original width 640 height 480
 def start_video_stream():
-    cmd=f"libcamera-vid -t 0 --width 160 --height 120 --inline --hflip --vflip --output udp://{server_ip}:{server_port}"
+    cmd=f"libcamera-vid -t 0 --width 160 --height 120 --inline --hflip --vflip --output udp://{server_ip}:{UDP_port}"
     
     print("Starting libcamera-vid stream...")
     subprocess.Popen(cmd, shell=True)
     print("Video stream started")
 
 threading.Thread(target=start_video_stream, daemon=True).start()
-start_tcp_server()
+start_udp_server()
+
