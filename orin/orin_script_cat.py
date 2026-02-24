@@ -12,36 +12,37 @@ from collections import deque
 from statistics import mean
 from typing import Dict, Tuple, List
 
-#Run this file when running categorical model as categorical outputs need to be translated to continuous values
+# Run this file when running categorical model as categorical outputs need to be translated to continuous values
+# Updated: control channel changed from TCP -> UDP (video remains UDP). Based on your original script. :contentReference[oaicite:0]{index=0}
 
 def throttle_curve(raw_throttle):
-    MAX_THROTTLE = 0.18 
+    MAX_THROTTLE = 0.18
     BASE_THROTTLE = 0.11
-    
+
     if raw_throttle < 0:
         return raw_throttle * 0.3
     else:
         return min(MAX_THROTTLE, BASE_THROTTLE + (raw_throttle * 0.7))
-    
+
 def steering_curve(raw_steering):
-    RIGHT_TURN_MULTIPLIER = 1.3 
-    
-    if raw_steering > 0:  
+    RIGHT_TURN_MULTIPLIER = 1.3
+
+    if raw_steering > 0:
         if raw_steering < 0.2:
             return raw_steering * 2.0 * RIGHT_TURN_MULTIPLIER
         elif raw_steering < 0.4:
             return raw_steering * 1.5 * RIGHT_TURN_MULTIPLIER
         else:
             return (raw_steering ** 2) * RIGHT_TURN_MULTIPLIER
-    else:  
+    else:
         if abs(raw_steering) < 0.2:
             return raw_steering * 2.0
         elif abs(raw_steering) < 0.4:
             return raw_steering * 1.5
         else:
-            return (abs(raw_steering) ** 2) * -1.0 # Maintain negative sign
+            return (abs(raw_steering) ** 2) * -1.0  # Maintain negative sign
 
-#rolling window of roughly 60 seconds of history captured
+# rolling window of roughly 60 seconds of history captured
 class MetricsTracker:
     def __init__(self, window_size=1800):
         self.cpu_usage = deque(maxlen=window_size)
@@ -54,7 +55,7 @@ class MetricsTracker:
         self.fps = deque(maxlen=window_size)  # Track frames processed per second
         self.last_frame_count = 0
         self.last_fps_time = time.time()
-    
+
     def update_system_metrics(self):
         cpu_percent_per_core = psutil.cpu_percent(interval=None, percpu=True)
         with self.metrics_lock:
@@ -64,7 +65,7 @@ class MetricsTracker:
             # Add queue size tracking
             self.queue_sizes.append(frame_queue.qsize())
 
-            #Calculate FPS (frames processed per second)
+            # Calculate FPS (frames processed per second)
             current_time = time.time()
             if current_time - self.last_fps_time >= 1.0:
                 current_frame_count = sum(conn.frames_received for conn in pi_connections.values())
@@ -97,13 +98,18 @@ class MetricsTracker:
             self.last_print_time = current_time
 
 class PiConnection:
-    def __init__(self, pi_id: str, ip: str, UDP_PORT: int, TCP_PORT: int, 
+    def __init__(self, pi_id: str, ip: str, UDP_PORT: int, TCP_PORT: int,
                  frame_queue: queue.Queue, model_queue: queue.Queue):
         self.pi_id = pi_id
         self.ip = ip
         self.UDP_PORT = UDP_PORT
+
+        # Note: keeping name TCP_PORT to minimize edits; it now represents the Pi's UDP *control* port.
         self.TCP_PORT = TCP_PORT
-        self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        # UDP socket for controls (changed from TCP)
+        self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
         self.frame_queue = frame_queue
         self.model_queue = model_queue
         self.running = True
@@ -116,27 +122,26 @@ class PiConnection:
         self.latest_throttle = 0
 
     def start(self):
-        # Connect control socket
-        self.control_socket.connect((self.ip, self.TCP_PORT))
-        
-        # Start video capture
+        # No connect() for UDP controls
+
+        # Start video capture (already UDP)
         self.cap = cv2.VideoCapture(f"udp://{self.ip}:{self.UDP_PORT}", cv2.CAP_FFMPEG)
         if not self.cap.isOpened():
             raise RuntimeError(f"Failed to open video stream from {self.ip}")
-        
+
         # Start video receiver thread
         self.video_thread = threading.Thread(target=self._video_loop)
         self.video_thread.daemon = True
         self.video_thread.start()
-        
+
         # Start control sender thread
         self.control_thread = threading.Thread(target=self._control_loop)
         self.control_thread.daemon = True
         self.control_thread.start()
-        
+
         print(f"Started connection to {self.pi_id} at {self.ip}")
 
-   #Thread that receives frames from its assigned pi and puts them in processing queue
+    # Thread that receives frames from its assigned pi and puts them in processing queue
     def _video_loop(self):
         while self.running:
             try:
@@ -144,7 +149,7 @@ class PiConnection:
                 if ret:
                     self.frames_received += 1
                     self.last_frame_time = time.time()
-                    self.latest_frame = frame.copy() # Store a copy of the latest frame for display
+                    self.latest_frame = frame.copy()  # Store a copy of the latest frame for display
                     self.frame_queue.put((self.pi_id, frame))
                 else:
                     time.sleep(0.01)  # Short sleep if no frame
@@ -152,7 +157,7 @@ class PiConnection:
                 print(f"Error in video loop for {self.pi_id}: {e}")
                 time.sleep(0.1)  # Prevent tight loop on error
 
-    #Thread that sends control values back to its assigned Pi
+    # Thread that sends control values back to its assigned Pi (now UDP)
     def _control_loop(self):
         while self.running:
             try:
@@ -162,8 +167,10 @@ class PiConnection:
                 self.latest_steering = steering
                 self.latest_throttle = throttle
 
-                message = f"{steering},{throttle}\n"
-                self.control_socket.sendall(message.encode())
+                # UDP payload: "steering,throttle"
+                message = f"{steering},{throttle}".encode("utf-8")
+                self.control_socket.sendto(message, (self.ip, self.TCP_PORT))
+
                 self.controls_sent += 1
                 self.last_control_time = time.time()
                 self.model_queue.task_done()
@@ -173,12 +180,12 @@ class PiConnection:
                 print(f"Error sending controls to {self.pi_id}: {e}")
                 time.sleep(0.1)  # Prevent tight loop on error
 
-    #Return connection status info
+    # Return connection status info
     def get_status(self):
         now = time.time()
         frame_age = now - self.last_frame_time if self.last_frame_time > 0 else float('inf')
         control_age = now - self.last_control_time if self.last_control_time > 0 else float('inf')
-        
+
         return {
             'pi_id': self.pi_id,
             'frames_received': self.frames_received,
@@ -188,28 +195,27 @@ class PiConnection:
             'healthy': frame_age < 1.0 and control_age < 1.0
         }
 
-    #Cleanup resources
+    # Cleanup resources
     def cleanup(self):
         self.running = False
         time.sleep(0.5)  # Allow threads to exit gracefully
-        
+
         if hasattr(self, 'cap') and self.cap.isOpened():
             self.cap.release()
-            
+
         try:
-            self.control_socket.shutdown(socket.SHUT_RDWR)
-            self.control_socket.close()
+            self.control_socket.close()  # No shutdown() for UDP
         except:
             pass  # Socket might already be closed
 
-#Worker threads that perform model inference on frames
+# Worker threads that perform model inference on frames
 def inference_worker(frame_queues, model_queues, interpreter, input_details, output_details, metrics):
     while True:
         try:
             # Get frame from queue
             pi_id, frame = frame_queues.get(timeout=0.1)
             frame = cv2.flip(frame, 0)
-            
+
             # Process frame
             processed_frame = cv2.resize(frame, (IMAGE_W, IMAGE_H))
             processed_frame = np.expand_dims(processed_frame, axis=0)
@@ -219,56 +225,55 @@ def inference_worker(frame_queues, model_queues, interpreter, input_details, out
             inference_start = time.time()
             interpreter.set_tensor(input_details[0]['index'], processed_frame)
             interpreter.invoke()
-            
+
             # Get categorical outputs
             steering_output = interpreter.get_tensor(output_details[0]['index'])[0]
             throttle_output = interpreter.get_tensor(output_details[1]['index'])[0]
-            
+
             # Convert categorical outputs to continuous values
-            # Assuming outputs are probability distributions over bins
             num_steering_bins = len(steering_output)
             num_throttle_bins = len(throttle_output)
-            
+
             # Creates bin centers (e.g., -1.0 to 1.0)
             steering_bins = np.linspace(-1.0, 1.0, num_steering_bins)
             throttle_bins = np.linspace(-1.0, 1.0, num_throttle_bins)
-            
+
             # Get weighted average, or expected value
             steering = float(np.sum(steering_output * steering_bins))
             raw_throttle = float(np.sum(throttle_output * throttle_bins))
-            
+
             throttle = throttle_curve(raw_throttle)
             steering = steering_curve(steering)
-            
+
             # Add to pi's model queue
             model_queues[pi_id].put((steering, throttle))
-            
+
             # Update metrics
             metrics.add_inference_time(inference_start)
-            
+
             # Mark task as done
             frame_queues.task_done()
-            
+
         except queue.Empty:
             pass  # No frames to process
         except Exception as e:
             print(f"Error in inference worker: {e}")
             time.sleep(0.1)  # Prevent tight loop on error
 
-#Thread that reports connection status
+# Thread that reports connection status
 def status_reporter(pi_connections, stop_event):
     while not stop_event.is_set():
         try:
             time.sleep(10)  # Report connection status every 10 seconds
             print("\n--- Connection Status Report ---")
-            
+
             all_healthy = True
             for conn in pi_connections.values():
                 status = conn.get_status()
                 health = "✓" if status['healthy'] else "✗"
                 print(f"{status['pi_id']}: {health} | Frames: {status['frames_received']} | Controls: {status['controls_sent']}")
                 all_healthy = all_healthy and status['healthy']
-                
+
             print(f"Overall system health: {'Good' if all_healthy else 'Issues Detected'}")
             print("--------------------------------\n")
         except Exception as e:
@@ -280,43 +285,43 @@ def metrics_monitor(metrics, stop_event):
         metrics.print_metrics()
         time.sleep(1)
 
-#Starts thread displaying frames from all pi connections 
-def display_frames(pi_connections, stop_event):    
+# Starts thread displaying frames from all pi connections
+def display_frames(pi_connections, stop_event):
     # Create windows for each Pi
     for pi_id in pi_connections:
         cv2.namedWindow(f"Camera Feed - {pi_id}", cv2.WINDOW_NORMAL)
         cv2.resizeWindow(f"Camera Feed - {pi_id}", 640, 480)
-    
+
     # Create shared dictionary to store latest frames
     latest_frames = {}
-    
+
     while not stop_event.is_set():
         for pi_id, connection in pi_connections.items():
             # Update frames if connection has a latest_frame
             if hasattr(connection, 'latest_frame') and connection.latest_frame is not None:
                 latest_frames[pi_id] = connection.latest_frame
-            
+
             # Display the latest frame
             if pi_id in latest_frames:
                 # Text overlay displaying steering/throttle values
                 frame = latest_frames[pi_id].copy()
 
                 if hasattr(connection, 'latest_steering') and hasattr(connection, 'latest_throttle'):
-                    cv2.putText(frame, f"Steering: {connection.latest_steering:.2f}", 
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(frame, f"Throttle: {connection.latest_throttle:.2f}", 
-                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
+                    cv2.putText(frame, f"Steering: {connection.latest_steering:.2f}",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(frame, f"Throttle: {connection.latest_throttle:.2f}",
+                                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
                 cv2.imshow(f"Camera Feed - {pi_id}", frame)
-        
+
         # press 'q' to quit
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             stop_event.set()
             break
-            
+
         time.sleep(0.03)  # Sleep to control frame rate
-    
+
     # Clean up
     for pi_id in pi_connections:
         cv2.destroyWindow(f"Camera Feed - {pi_id}")
@@ -328,8 +333,8 @@ IMAGE_DEPTH = 3
 
 PI_CONFIGS = {
     'pi1': {'ip': '192.168.1.65', 'UDP_PORT': 5000, 'TCP_PORT': 6000},
-    'pi3':{'ip':'192.168.1.219','UDP_PORT': 2000, 'TCP_PORT': 4000}
-    # Add Pis here, include ip address and the UDP_PORT + TCP_PORT each pi will be occupying
+    'pi3': {'ip': '192.168.1.219', 'UDP_PORT': 2000, 'TCP_PORT': 4000}
+    # Add Pis here, include ip address and the UDP_PORT (video) + control port (stored in TCP_PORT) each pi will be occupying
 }
 
 # Insert categorical model path here
@@ -349,8 +354,8 @@ for pi_id, config in PI_CONFIGS.items():
     try:
         connection = PiConnection(
             pi_id=pi_id,
-            ip=config['ip'], 
-            UDP_PORT=config['UDP_PORT'], 
+            ip=config['ip'],
+            UDP_PORT=config['UDP_PORT'],
             TCP_PORT=config['TCP_PORT'],
             frame_queue=frame_queue,
             model_queue=model_queues[pi_id]
@@ -370,8 +375,8 @@ for _ in range(num_inference_workers):
     worker_output_details = worker_interpreter.get_output_details()
 
     thread = threading.Thread(
-        target=inference_worker, 
-        args=(frame_queue, model_queues, worker_interpreter, 
+        target=inference_worker,
+        args=(frame_queue, model_queues, worker_interpreter,
               worker_input_details, worker_output_details, metrics)
     )
     thread.daemon = True
@@ -401,8 +406,8 @@ try:
 except KeyboardInterrupt:
     print("\nShutdown requested...")
 finally:
-    stop_event.set()    
+    stop_event.set()
     for connection in pi_connections.values():
         connection.cleanup()
-    
+
     print("Shutdown complete.")
